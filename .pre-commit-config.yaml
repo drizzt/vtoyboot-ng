@@ -1,0 +1,30 @@
+# Install the hook with: pre-commit install
+# Needs shellcheck, shfmt, gawk and devscripts (for checkbashisms) on PATH.
+repos:
+  - repo: local
+    hooks:
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck -xo all
+        language: system
+        files: &shell_files >-
+          ^(vtoyboot-ng|test/[^/]+\.sh|hook/(dracut\.conf|ventoy-map\.sh|freebsd-rc|mkinitcpio-(hook|install)|initramfs-tools-(hook|block)))$
+
+      - id: shfmt
+        name: shfmt (2-space indent, Google shell style)
+        entry: shfmt -i 2 -ci -bn -d
+        language: system
+        files: *shell_files
+
+      - id: line-length
+        name: shell lines within 80 columns
+        entry: 'awk ''length > 80 { printf "%s:%d: %d columns\n", FILENAME, FNR, length; rc = 1 } END { exit rc }'''
+        language: system
+        files: *shell_files
+
+      # The initramfs hooks run under dash or busybox ash, never bash.
+      - id: checkbashisms
+        name: checkbashisms (POSIX sh hooks)
+        entry: checkbashisms -pfx
+        language: system
+        files: ^hook/(ventoy-map\.sh|freebsd-rc|mkinitcpio-hook|initramfs-tools-(hook|block))$

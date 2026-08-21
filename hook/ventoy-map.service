@@ -1,0 +1,11 @@
+[Unit]
+Description=Map the Ventoy vdisk this system boots from
+DefaultDependencies=no
+ConditionPathExists=/etc/initrd-release
+After=systemd-udev-trigger.service
+Before=initrd-root-device.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /etc/vtoyboot-ng/hook/ventoy-map.sh

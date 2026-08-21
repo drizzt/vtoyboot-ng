@@ -1,0 +1,7 @@
+#!/usr/bin/ash
+# shellcheck shell=dash
+# vtoyboot-ng mkinitcpio runtime hook (/etc/initcpio/hooks/ventoy)
+
+run_hook() {
+  sh /etc/vtoyboot-ng/hook/ventoy-map.sh
+}

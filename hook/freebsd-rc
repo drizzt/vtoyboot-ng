@@ -1,0 +1,17 @@
+#!/bin/sh
+# vtoyboot-ng: /etc/rc of the mfsroot, the fallback root the kernel mounts
+# when the device named by vfs.root.mountfrom is missing. Map the Ventoy
+# vdisk so that it appears, then reroot onto it. A non-zero exit drops init
+# into a single-user shell, which is the error path.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mapped() { [ -e /dev/vtoy.nop ] || [ -e /dev/concat/vtoy ]; }
+if mapped; then
+  # the kernel runs the same root candidate list again after the reroot,
+  # and lands here again when the root is still missing
+  echo "vtoyboot-ng: vdisk already mapped, root still not found" >&2
+  exit 1
+fi
+mount -u -o rw /
+sh /etc/vtoyboot-ng/hook/ventoy-map.sh
+mapped || exit 1
+exec reboot -r

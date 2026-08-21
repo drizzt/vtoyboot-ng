@@ -1,0 +1,774 @@
+#!/usr/bin/env bash
+# vtoyboot-ng: make a Linux or FreeBSD install inside a vdisk bootable from
+# Ventoy.
+#
+#   vtoyboot-ng install [--keep-fallback]
+#   vtoyboot-ng uninstall
+#   vtoyboot-ng refresh
+#
+# Everything written to the target lives under /etc (plus files on the ESP),
+# so it works on read-only /usr (ostree) and survives kernel updates.
+
+set -euo pipefail
+# what we write ends up in the initramfs and in package hooks run as root:
+# never let a permissive caller umask make any of it group/world writable
+umask 022
+
+readonly ETC=/etc/vtoyboot-ng
+SELF=$(readlink -f "$0")
+readonly SELF
+SRC=$(dirname "${SELF}")/hook
+[[ -d ${SRC} ]] || SRC=${ETC}/hook
+readonly SRC
+
+# modules the initramfs needs; each generator drops the ones its target kernel
+# does not have, so the list stays right across kernel updates
+DRIVERS="loop efivarfs exfat ntfs3 vfat ext4 xfs udf btrfs \
+nls_utf8 nls_cp437 nls_iso8859-1 nls_ascii \
+usb_storage uas xhci_pci xhci_hcd ehci_pci ehci_hcd ohci_pci uhci_hcd sd_mod"
+readonly DRIVERS
+# commands ventoy-map.sh needs inside the initramfs
+BINARIES="losetup od tr dd uname cat head tail grep modprobe udevadm mount \
+umount mkdir chmod ln rm sleep"
+readonly BINARIES
+KVER=$(uname -r)
+readonly KVER
+readonly BIOS_BOOT_GUID=21686148-6449-6e6f-744e-656564454649
+readonly ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+
+die() {
+  echo "vtoyboot-ng: $*" >&2
+  exit 1
+}
+msg() { echo "==> $*"; }
+created() {
+  grep -qxF "$1" "${ETC}/created" 2>/dev/null || echo "$1" >>"${ETC}/created"
+}
+
+# install FILE DEST: copy and record for uninstall
+put() {
+  mkdir -p "$(dirname "$2")"
+  cp "$1" "$2"
+  created "$2"
+}
+
+# sync_file FILE DEST: install DEST when missing, keep it in sync when it is
+# one of ours; anything else already on disk is left alone
+sync_file() {
+  if [[ ! -e $2 ]]; then
+    put "$1" "$2"
+  elif grep -qxF "$2" "${ETC}/created" 2>/dev/null; then
+    cp "$1" "$2"
+  fi
+}
+
+# -------------------------------------------------------------- detection --
+
+BOOT_WAS_RO=0 ESP_TMP=0
+cleanup() {
+  # best effort: both can fail (a busy /boot keeps its read-write state until
+  # the next boot) and must not turn a successful install into a failure
+  if ((ESP_TMP == 1)); then
+    umount "${ESP}" 2>/dev/null && rmdir "${ESP}" 2>/dev/null || :
+  fi
+  if ((BOOT_WAS_RO == 1)); then
+    mount -o remount,ro /boot 2>/dev/null \
+      || msg "/boot left read-write, it goes back to read-only on reboot"
+  fi
+  return 0
+}
+
+# Sets the globals the rest of the script runs on: DISTRO, INITRD, REGEN,
+# GRUB, DISK, ESP_DEV, ESP, BOOTLOADER, and the cleanup flags BOOT_WAS_RO
+# and ESP_TMP. Installs the EXIT trap that undoes those two.
+detect() {
+  local uid
+  uid=$(id -u)
+  ((uid == 0)) || die "run as root"
+  # in a subshell: os-release would drop ~15 names into our scope
+  # shellcheck disable=SC1091
+  DISTRO=$(
+    . /etc/os-release
+    echo "${ID:-} ${ID_LIKE:-}"
+  )
+  local os
+  os=$(uname -s)
+  if [[ ${os} == FreeBSD ]]; then
+    bsd_detect
+    return 0
+  fi
+
+  REGEN=
+  if [[ -f /run/ostree-booted ]]; then
+    # rpm-ostree drives dracut itself, the generator is never called directly
+    INITRD=dracut REGEN=rpm-ostree
+  elif command -v mkinitcpio >/dev/null; then
+    INITRD=mkinitcpio
+  elif command -v update-initramfs >/dev/null; then
+    INITRD=initramfs-tools
+  elif command -v dracut >/dev/null; then
+    INITRD=dracut
+  else
+    die "no supported initramfs generator (dracut, mkinitcpio, initramfs-tools)"
+  fi
+  REGEN=${REGEN:-${INITRD}}
+
+  if command -v grub2-install >/dev/null; then
+    GRUB=grub2
+  elif command -v grub-install >/dev/null; then
+    GRUB=grub
+  else
+    GRUB=
+  fi
+
+  # disk holding /: last ancestor in the inverse tree (partition, LUKS, LVM...)
+  local dev m
+  for m in / /sysroot; do
+    dev=$(findmnt -no SOURCE "${m}" 2>/dev/null || true)
+    dev=${dev%%\[*}
+    [[ -b ${dev} ]] && break
+  done
+  [[ -b ${dev} ]] || die "cannot find the block device holding /" \
+    "(composefs/overlay root without /sysroot?)"
+  DISK=$(lsblk -nsrpo NAME "${dev}" | tail -n1)
+  # md/LVM spanning several disks: installing the BIOS boot code to one
+  # arbitrary member is worse than not installing it at all
+  local disks ndisks
+  disks=$(lsblk -nsrpo NAME,TYPE "${dev}" | awk '$2=="disk"{printf "%s ", $1}')
+  ndisks=$(wc -w <<<"${disks}")
+  [[ ${ndisks} -le 1 ]] \
+    || die "/ spans more than one disk (${disks})," \
+      "refusing to guess which one boots"
+
+  trap cleanup EXIT
+  # bootc mounts /boot read-only
+  if findmnt -no OPTIONS /boot 2>/dev/null | grep -qE '(^|,)ro(,|$)'; then
+    mount -o remount,rw /boot
+    BOOT_WAS_RO=1
+  fi
+
+  ESP_DEV=$(lsblk -nrpo NAME,PARTTYPE "${DISK}" \
+    | awk -v g="${ESP_GUID}" '$2==g{print $1; exit}')
+  ESP=
+  if [[ -n ${ESP_DEV} ]]; then
+    # findmnt exits 1 when unmounted, which is the case handled below
+    ESP=$(findmnt -nfro TARGET "${ESP_DEV}" 2>/dev/null || true)
+    if [[ -z ${ESP} ]]; then
+      ESP=/run/vtoyboot-ng-esp
+      mkdir -p "${ESP}"
+      mount -o nosuid,nodev,noexec "${ESP_DEV}" "${ESP}"
+      ESP_TMP=1
+    fi
+  fi
+
+  BOOTLOADER=grub
+  # openSUSE ships the systemd-boot binary as grub.efi so shim can load it,
+  # so match the vendor directory instead of the file name
+  if [[ -n ${ESP} && -d ${ESP}/EFI/systemd ]]; then
+    BOOTLOADER=systemd-boot
+  elif command -v limine >/dev/null && [[ -e /boot/limine.conf ||
+    -e ${ESP:-/nonexistent}/limine.conf ||
+    -e ${ESP:-/nonexistent}/EFI/BOOT/limine.conf ]]; then
+    BOOTLOADER=limine
+  fi
+  [[ -n ${GRUB} || ${BOOTLOADER} != grub ]] \
+    || die "no bootloader found (grub, systemd-boot, limine)"
+
+  msg "initramfs: ${INITRD}, bootloader: ${BOOTLOADER}," \
+    "disk: ${DISK}, ESP: ${ESP:-none}"
+}
+
+# FreeBSD: no initramfs, a preloaded mfsroot the kernel falls back to when
+# the root device is missing, and no mount of the Ventoy partition. Sets the
+# same globals plus ROOTFS (ufs/zfs); GRUB stays empty.
+bsd_detect() {
+  local osver
+  osver=$(uname -K)
+  ((osver >= 1300000)) || die "FreeBSD 13.0 or newer needed"
+  INITRD=mfsroot REGEN=mfsroot BOOTLOADER=freebsd
+  GRUB=
+  trap cleanup EXIT
+
+  # Ventoy boots the copy from /dev/vtoy.nopp*, so fstab must name the root
+  # by label (what the official images do), never by /dev/ada0p2
+  local src provs root
+  root=$(mount -p | awk '$2=="/"{print $1, $3}')
+  read -r src ROOTFS <<<"${root}"
+  case ${ROOTFS}:${src} in
+    ufs:/dev/gpt/* | ufs:/dev/ufs/* | ufs:/dev/ufsid/* | ufs:/dev/label/*)
+      provs=${src#/dev/}
+      ;;
+    ufs:*)
+      die "/ is mounted from ${src}: a Ventoy boot cannot find it by that" \
+        "name. Label the partition (gpart modify -l rootfs -i N DISK) and" \
+        "put /dev/gpt/rootfs in /etc/fstab first"
+      ;;
+    zfs:*)
+      provs=$(zpool list -vHP "${src%%/*}" | awk 'NR>1{sub("^/dev/", "", $1);
+        print $1}')
+      ;;
+    *) die "unsupported root filesystem ${ROOTFS} on ${src}" ;;
+  esac
+  # disk(s) under each provider: the conftxt tree is depth first, so the
+  # last DISK line above a provider is the disk it sits on (a label or a
+  # mirror member shows up under every disk it spans). Booted through
+  # Ventoy, the vdisk is the nop (or the concat of nops) over the stick,
+  # whose own table is gone while we hold it: that is the disk then.
+  local disks ndisks
+  disks=$(sysctl -n kern.geom.conftxt | awk -v p=" ${provs//$'\n'/ } " '
+    $2=="DISK" || $3=="vtoy.nop" || $3=="concat/vtoy"{d=$3}
+    index(p, " " $3 " "){print "/dev/" d}' | sort -u)
+  ndisks=$(wc -l <<<"${disks}")
+  [[ -n ${disks} ]] || die "cannot find the disk holding /"
+  [[ ${ndisks} -le 1 ]] \
+    || die "/ spans more than one disk (${disks//$'\n'/ })," \
+      "refusing to guess which one boots"
+  DISK=${disks}
+
+  ESP_DEV=$(gpart show -p "${DISK}" | awk '$4=="efi"{print $3; exit}')
+  ESP=
+  if [[ -n ${ESP_DEV} ]]; then
+    # mounted under its own name or under one of its labels (gpt/efiesp)
+    local names
+    names=$(glabel status -s | awk -v e="${ESP_DEV}" '$3==e{print "/dev/" $1}
+      END{print "/dev/" e}')
+    ESP=$(mount -p | awk -v n=" ${names//$'\n'/ } " \
+      'index(n, " " $1 " "){print $2; exit}')
+    if [[ -z ${ESP} ]]; then
+      ESP=$(mktemp -d)
+      mount -t msdosfs -o nosuid,noexec "/dev/${ESP_DEV}" "${ESP}"
+      ESP_TMP=1
+    fi
+  fi
+
+  msg "initramfs: mfsroot, bootloader: freebsd (${ROOTFS})," \
+    "disk: ${DISK}, ESP: ${ESP:-none}"
+}
+
+# the Ventoy partition is exFAT: without the module nothing works
+check_exfat() {
+  modinfo -n ntfs3 >/dev/null 2>&1 \
+    || msg "note: no ntfs3 module for ${KVER}," \
+      "an NTFS-formatted Ventoy partition will not work"
+  modinfo -n exfat >/dev/null 2>&1 && return 0
+  case ${DISTRO} in
+    *ubuntu*)
+      die "exfat module missing for ${KVER}:" \
+        "apt install linux-modules-extra-${KVER}, then re-run"
+      ;;
+    *) die "exfat kernel module missing for ${KVER}" ;;
+  esac
+}
+
+# ----------------------------------------------------------- initramfs --
+
+install_hook() {
+  mkdir -p "${ETC}/hook"
+  HOOK_CHANGED=0
+  cmp -s "${SRC}/ventoy-map.sh" "${ETC}/hook/ventoy-map.sh" || HOOK_CHANGED=1
+  [[ ${SRC} == "${ETC}/hook" ]] || cp "${SRC}"/* "${ETC}/hook/"
+  [[ ${SELF} == "${ETC}/vtoyboot-ng" ]] || cp "${SELF}" "${ETC}/vtoyboot-ng"
+
+  case ${INITRD} in
+    dracut)
+      # leftover of the original vtoyboot: its dracut module is gone and
+      # the conf it left behind breaks dracut
+      if grep -qs 'add_dracutmodules.*ventoy' /etc/dracut.conf.d/ventoy.conf \
+        && [[ ! -d /usr/lib/dracut/modules.d/99ventoy ]]; then
+        msg "removing stale /etc/dracut.conf.d/ventoy.conf (old vtoyboot)"
+        rm -f /etc/dracut.conf.d/ventoy.conf
+      fi
+      put "${SRC}/ventoy-map.service" /etc/systemd/system/ventoy-map.service
+      mkdir -p /etc/systemd/system/initrd-root-device.target.wants
+      ln -sf ../ventoy-map.service \
+        /etc/systemd/system/initrd-root-device.target.wants/ventoy-map.service
+      created \
+        /etc/systemd/system/initrd-root-device.target.wants/ventoy-map.service
+      mkdir -p /etc/dracut.conf.d
+      sed -e "s/@DRIVERS@/${DRIVERS}/" -e "s/@BINARIES@/${BINARIES}/" \
+        "${SRC}/dracut.conf" >/etc/dracut.conf.d/90-vtoyboot-ng.conf
+      created /etc/dracut.conf.d/90-vtoyboot-ng.conf
+      ;;
+    mkinitcpio)
+      put "${SRC}/ventoy-map.service" /etc/systemd/system/ventoy-map.service
+      mkdir -p /etc/initcpio/install /etc/initcpio/hooks /etc/mkinitcpio.conf.d
+      sed -e "s/@DRIVERS@/${DRIVERS}/" -e "s/@BINARIES@/${BINARIES}/" \
+        "${SRC}/mkinitcpio-install" >/etc/initcpio/install/ventoy
+      created /etc/initcpio/install/ventoy
+      put "${SRC}/mkinitcpio-hook" /etc/initcpio/hooks/ventoy
+      # run right after block, so encrypt/lvm2 find the vdisk partitions
+      cat >/etc/mkinitcpio.conf.d/vtoyboot-ng.conf <<-'EOT'
+			_vt=()
+			for _h in "${HOOKS[@]}"; do
+			  _vt+=("$_h")
+			  [[ $_h == block ]] && _vt+=(ventoy)
+			done
+			[[ " ${_vt[*]} " == *" ventoy "* ]] || _vt+=(ventoy)
+			HOOKS=("${_vt[@]}")
+			unset _vt _h
+		EOT
+      created /etc/mkinitcpio.conf.d/vtoyboot-ng.conf
+      ;;
+    initramfs-tools)
+      mkdir -p /etc/initramfs-tools/hooks
+      sed -e "s/@DRIVERS@/${DRIVERS}/" -e "s/@BINARIES@/${BINARIES}/" \
+        "${SRC}/initramfs-tools-hook" >/etc/initramfs-tools/hooks/ventoy
+      chmod +x /etc/initramfs-tools/hooks/ventoy
+      created /etc/initramfs-tools/hooks/ventoy
+      put "${SRC}/initramfs-tools-block" \
+        /etc/initramfs-tools/scripts/local-block/ventoy
+      chmod +x /etc/initramfs-tools/scripts/local-block/ventoy
+      ;;
+    mfsroot) ;;
+    *) die "unknown initramfs generator ${INITRD}" ;;
+  esac
+}
+
+# A root filesystem the kernel boots into only when the one in fstab is
+# missing (vfs.root.mountfrom fails, md0 is next on the list): the hook and
+# the binaries it needs, copied from this system with their libraries, and
+# an /etc/rc that maps the vdisk and reroots. Rebuilt by "refresh" since the
+# copies never see an upgrade.
+bsd_mfsroot() {
+  msg "building /boot/vtoyboot-ng/mfsroot"
+  local stage bins b l out
+  stage=$(mktemp -d)
+  mkdir -p "${stage}"/{dev,tmp,sbin,libexec,etc/vtoyboot-ng/hook}
+  cp "${ETC}/hook/ventoy-map.sh" "${stage}/etc/vtoyboot-ng/hook/"
+  install -m 755 "${ETC}/hook/freebsd-rc" "${stage}/etc/rc"
+  # mount -u warns without one
+  : >"${stage}/etc/fstab"
+  # init is static, which reboot -r relies on; the rest is dynamic
+  bins="/sbin/init /bin/sh /sbin/reboot /sbin/mount /bin/kenv /bin/dd
+    /sbin/sysctl /usr/bin/od /usr/bin/tr /usr/bin/head /usr/bin/tail
+    /usr/bin/uname /bin/cat /bin/rm /bin/ls /bin/sleep /sbin/geom
+    /usr/sbin/efivar /lib/geom/geom_nop.so /lib/geom/geom_concat.so"
+  for b in ${bins}; do
+    [[ -e ${b} ]] || die "${b} missing"
+    # ldd fails on the static init, which then needs nothing; the [vdso]
+    # line is dropped with the grep
+    for l in "${b}" $(ldd -f '%p\n' "${b}" 2>/dev/null | grep '^/'); do
+      mkdir -p "${stage}$(dirname "${l}")"
+      cp "${l}" "${stage}${l}"
+    done
+  done
+  cp /libexec/ld-elf.so.1 "${stage}/libexec/"
+  ln -s geom "${stage}/sbin/gnop"
+  ln -s geom "${stage}/sbin/gconcat"
+  out=${stage}.img
+  # slack for the copy of the parameter block the hook writes to /tmp
+  makefs -t ffs -o version=2,minfree=0 -b 1m -f 16 "${out}" "${stage}" \
+    >/dev/null
+  gzip -9n "${out}"
+  put "${out}.gz" /boot/vtoyboot-ng/mfsroot.gz
+  rm -rf "${stage}" "${out}.gz"
+  # the loader's gzipfs adds .gz by itself and rejects a name that has it
+  mkdir -p /boot/loader.conf.d
+  cat >/boot/loader.conf.d/vtoyboot-ng.conf <<-'EOT'
+		vtoyboot_load="YES"
+		vtoyboot_type="mfs_root"
+		vtoyboot_name="/boot/vtoyboot-ng/mfsroot"
+		geom_nop_load="YES"
+		geom_concat_load="YES"
+	EOT
+  created /boot/loader.conf.d/vtoyboot-ng.conf
+}
+
+regen_initramfs() {
+  msg "regenerating initramfs (${REGEN})"
+  case ${REGEN} in
+    mfsroot) [[ ${1:-install} == uninstall ]] || bsd_mfsroot ;;
+    dracut)
+      dracut -f --regenerate-all
+      # sdbootutil (openSUSE) keeps a second copy of the initrd on the ESP
+      # and that is the one its boot entries point at; /boot stays the
+      # source for the grub BIOS companion, so both have to be rebuilt
+      if command -v sdbootutil >/dev/null; then
+        sdbootutil --no-reuse-initrd add-all-kernels
+      fi
+      ;;
+    mkinitcpio) mkinitcpio -P ;;
+    initramfs-tools) update-initramfs -u -k all ;;
+    rpm-ostree)
+      if [[ ${1:-install} == uninstall ]]; then
+        ((${OSTREE_ENABLED:-0} == 1)) && rpm-ostree initramfs --disable
+      elif rpm-ostree initramfs | grep -q ': enabled'; then
+        if ((${HOOK_CHANGED:-0} == 1)); then
+          # the only way to force a rebuild: toggle regeneration off and on
+          rpm-ostree initramfs --disable
+          rpm-ostree initramfs --enable
+        else
+          msg "client-side initramfs regeneration already enabled," \
+            "nothing to rebuild"
+          return 0
+        fi
+      else
+        rpm-ostree initramfs --enable
+        echo OSTREE_ENABLED=1 >>"${ETC}/conf"
+      fi
+      msg "reboot into the new deployment to use the new initramfs"
+      ;;
+    *) die "unknown initramfs generator ${REGEN}" ;;
+  esac
+}
+
+# ------------------------------------------------------------ bootloader --
+
+# echo the first of its arguments that exists, nothing when none does
+first_existing() {
+  local p
+  for p in "$@"; do
+    if [[ -e ${p} ]]; then
+      echo "${p}"
+      return 0
+    fi
+  done
+}
+
+# the distro's grub.cfg (grub/ or grub2/ is decided at grub build time)
+grub_cfg() {
+  local cfg
+  cfg=$(first_existing /boot/grub2/grub.cfg /boot/grub/grub.cfg)
+  echo "${cfg:-/boot/${GRUB}/grub.cfg}"
+}
+
+# first of the distro's grub module paths that exists (TARGET or TARGET/FILE)
+grub_moddir() {
+  first_existing "/usr/lib/grub/$1" "/usr/share/grub2/$1" "/usr/lib/grub2/$1"
+}
+
+bios_boot_partition() {
+  local pttype
+  pttype=$(lsblk -ndo PTTYPE "${DISK}")
+  [[ ${pttype} == gpt ]] || return 0
+  lsblk -nro PARTTYPE "${DISK}" | grep -qi "^${BIOS_BOOT_GUID}" && return 0
+  msg "adding a BIOS boot partition to ${DISK}"
+  # the disk is in use: keep the table we are about to rewrite
+  sfdisk -d "${DISK}" >"${ETC}/parttable.bak"
+  created "${ETC}/parttable.bak"
+  # Most tools set first-lba to 2048, so the 34..2047 gap is rejected by
+  # --append; rewrite the (unchanged) table with first-lba 34 instead.
+  # --no-reread: the disk is in use; sfdisk adds the partition via BLKPG.
+  {
+    sfdisk -d "${DISK}" | sed 's/^first-lba:.*/first-lba: 34/'
+    echo "start=34, size=2014, type=${BIOS_BOOT_GUID}"
+  } | sfdisk --quiet --no-reread "${DISK}"
+  udevadm settle
+}
+
+grub_bios() {
+  local moddir
+  moddir=$(grub_moddir i386-pc/boot.img)
+  if [[ -z ${moddir} ]]; then
+    local d
+    case ${DISTRO} in
+      *debian* | *ubuntu*) d=grub-pc-bin ;;
+      *fedora* | *rhel* | *centos*) d=grub2-pc-modules ;;
+      *suse*) d=grub2-i386-pc ;;
+      *) d="the grub i386-pc target" ;;
+    esac
+    die "grub i386-pc modules missing, install ${d} and re-run"
+  fi
+  bios_boot_partition
+  msg "installing grub (BIOS) on ${DISK}"
+  "${GRUB}-install" --target=i386-pc --boot-directory=/boot "${DISK}"
+}
+
+# distro grub.cfg generated for UEFI with linuxefi/initrdefi cannot load on BIOS
+grub_linuxefi() {
+  local cfg
+  cfg=$(grub_cfg)
+  [[ -f ${cfg} ]] || return 0
+  grep -q '^\s*linuxefi' "${cfg}" || return 0
+  cat >/etc/grub.d/01_vtoyboot_linuxefi <<-'EOT'
+		#!/bin/sh
+		# vtoyboot-ng: let a grub.cfg written for UEFI boot on BIOS too
+		cat <<'EOC'
+		if [ "$grub_platform" = "pc" ]; then
+		  function linuxefi { linux "$@"; }
+		  function initrdefi { initrd "$@"; }
+		fi
+		EOC
+	EOT
+  chmod +x /etc/grub.d/01_vtoyboot_linuxefi
+  created /etc/grub.d/01_vtoyboot_linuxefi
+  "${GRUB}-mkconfig" -o "${cfg}"
+}
+
+# grub on a BIOS-installed system: add the UEFI half when an ESP exists
+grub_uefi() {
+  [[ -n ${ESP} ]] || return 0
+  if [[ -e ${ESP}/EFI/BOOT/BOOTX64.EFI ||
+    -e ${ESP}/EFI/BOOT/bootx64.efi ]]; then
+    return 0
+  fi
+  case ${DISTRO} in
+    *fedora* | *rhel* | *centos*)
+      msg "no UEFI bootloader on ${ESP}:" \
+        "dnf install shim-x64 grub2-efi-x64, then re-run"
+      return 0
+      ;;
+    *) ;;
+  esac
+  local moddir
+  moddir=$(grub_moddir x86_64-efi)
+  if [[ -z ${moddir} ]]; then
+    msg "no UEFI bootloader on ${ESP} and no grub x86_64-efi modules" \
+      "(grub-efi-amd64-bin), skipping"
+    return 0
+  fi
+  msg "installing grub (UEFI, removable) on ${ESP}"
+  "${GRUB}-install" --target=x86_64-efi --efi-directory="${ESP}" \
+    --boot-directory=/boot --removable
+}
+
+# Keep shim as BOOTX64.EFI but let it load grub directly instead of
+# fallback.efi, which would create NVRAM entries for the vdisk and
+# reboot in a loop.
+esp_fixup() {
+  [[ -n ${ESP} ]] || return 0
+  ((${KEEP_FALLBACK:-0} == 1)) && return 0
+  local boot d fb loader src
+  boot=${ESP}/EFI/BOOT
+  # the original vtoyboot replaced shim with grub; put shim back
+  if [[ -e ${boot}/BOOTX64.EFI_VTBK ]]; then
+    msg "restoring shim from ${boot}/BOOTX64.EFI_VTBK (old vtoyboot)"
+    mv -f "${boot}/BOOTX64.EFI_VTBK" "${boot}/BOOTX64.EFI"
+  fi
+  [[ -e ${boot}/fbx64.efi || -e ${boot}/fallback.efi ]] || return 0
+  # shim loads grubx64.efi (grub.efi on openSUSE) from its own directory
+  loader=
+  for fb in grubx64.efi grub.efi; do
+    [[ -e ${boot}/${fb} ]] && {
+      loader=${fb}
+      break
+    }
+    # prefer the distro's own vendor directory, then any other
+    for d in ${DISTRO} '*'; do
+      for src in "${ESP}"/EFI/${d}/"${fb}"; do
+        [[ -e ${src} ]] || continue
+        case ${src} in
+          */BOOT/*) continue ;;
+          *) ;;
+        esac
+        msg "copying ${src} to ${boot}/"
+        cp "${src}" "${boot}/${fb}"
+        created "${boot}/${fb}"
+        loader=${fb}
+        break 3
+      done
+    done
+  done
+  if [[ -z ${loader} ]]; then
+    msg "no grub efi binary found on ${ESP}, leaving the fallback in place"
+    return 0
+  fi
+  for fb in fbx64.efi fallback.efi; do
+    [[ -e ${boot}/${fb} ]] || continue
+    msg "disabling ${boot}/${fb}"
+    mv "${boot}/${fb}" "${boot}/${fb}.vtoyboot"
+  done
+}
+
+# also run on refresh: the BIOS stages and BOOTX64.EFI must stay on the same
+# limine version as the installed package
+limine_install() {
+  msg "installing limine (BIOS) on ${DISK}"
+  limine bios-install "${DISK}"
+  # stage 3 is a plain file next to limine.conf
+  # (/boot, /boot/limine or the ESP root)
+  local d
+  for d in /boot /boot/limine "${ESP:-/nonexistent}"; do
+    [[ -e ${d}/limine.conf ]] || continue
+    sync_file /usr/share/limine/limine-bios.sys "${d}/limine-bios.sys"
+    break
+  done
+  [[ -n ${ESP} ]] || return 0
+  sync_file /usr/share/limine/BOOTX64.EFI "${ESP}/EFI/BOOT/BOOTX64.EFI"
+}
+
+# FreeBSD: loader.efi as the removable-media loader when the ESP has none,
+# pmbr+gptboot (gptzfsboot) in a freebsd-boot partition for BIOS. Ventoy
+# decides "BIOS bootable" by a bios-boot partition or grub boot code, so an
+# empty one-track bios-boot partition silences its prompt when it fits.
+bsd_bootloader() {
+  local scheme idx stage
+  if [[ -n ${ESP} && ! -e ${ESP}/EFI/BOOT/BOOTX64.EFI &&
+    ! -e ${ESP}/EFI/BOOT/bootx64.efi ]]; then
+    msg "installing loader.efi as ${ESP}/EFI/BOOT/BOOTX64.EFI"
+    put /boot/loader.efi "${ESP}/EFI/BOOT/BOOTX64.EFI"
+  fi
+  scheme=$(gpart show "${DISK}" | awk '$1=="=>"{print $5; exit}')
+  if [[ ${scheme} != GPT ]]; then
+    msg "${scheme} partition scheme: BIOS boot code not installed"
+    return 0
+  fi
+  # the disk is in use: keep the table we are about to rewrite
+  gpart backup "${DISK}" >"${ETC}/parttable.bak"
+  created "${ETC}/parttable.bak"
+  idx=$(gpart show "${DISK}" | awk '$4=="freebsd-boot"{print $3; exit}')
+  if [[ -z ${idx} ]]; then
+    msg "adding a freebsd-boot partition to ${DISK}"
+    if ! idx=$(gpart add -t freebsd-boot -s 472 "${DISK}"); then
+      msg "no room for a freebsd-boot partition, BIOS boot skipped"
+      return 0
+    fi
+    idx=${idx%% *}
+    idx=${idx##*p}
+  fi
+  stage=/boot/gptboot
+  [[ ${ROOTFS} == zfs ]] && stage=/boot/gptzfsboot
+  msg "installing pmbr and ${stage} on ${DISK} partition ${idx}"
+  gpart bootcode -b /boot/pmbr -p "${stage}" -i "${idx}" "${DISK}" >/dev/null
+  gpart show "${DISK}" | grep -q bios-boot && return 0
+  gpart add -t bios-boot -b 34 -s 6 "${DISK}" >/dev/null 2>&1 \
+    || msg "no room for a bios-boot partition:" \
+      "Ventoy will ask for Enter on BIOS boots (see README)"
+}
+
+install_bootloader() {
+  case ${BOOTLOADER} in
+    freebsd) bsd_bootloader ;;
+    grub)
+      grub_bios
+      grub_linuxefi
+      grub_uefi
+      ;;
+    systemd-boot)
+      if [[ -z ${GRUB} ]]; then
+        msg "no grub: the vdisk will boot in UEFI mode only," \
+          "install grub and re-run for a BIOS companion"
+      else
+        grub_bios
+        local cfg
+        cfg=$(grub_cfg)
+        msg "writing ${cfg} for BIOS boot"
+        "${GRUB}-mkconfig" -o "${cfg}"
+      fi
+      ;;
+    limine) limine_install ;;
+    *) die "unknown bootloader ${BOOTLOADER}" ;;
+  esac
+  esp_fixup
+}
+
+# -------------------------------------------------------------- refresh --
+
+install_refresh_hooks() {
+  local r="${ETC}/vtoyboot-ng refresh"
+  if [[ -d /etc/pacman.d ]]; then
+    mkdir -p /etc/pacman.d/hooks
+    cat >/etc/pacman.d/hooks/95-vtoyboot-ng.hook <<-EOT
+			[Trigger]
+			Operation = Install
+			Operation = Upgrade
+			Type = Path
+			Target = usr/lib/modules/*/vmlinuz
+			Target = usr/share/limine/*
+			Target = usr/lib/systemd/boot/efi/*
+			Target = usr/share/shim-signed/*
+
+			[Action]
+			Description = vtoyboot-ng refresh
+			When = PostTransaction
+			Exec = ${r}
+		EOT
+    created /etc/pacman.d/hooks/95-vtoyboot-ng.hook
+  fi
+  if [[ -d /etc/apt/apt.conf.d ]]; then
+    echo "DPkg::Post-Invoke { \"${r} || true\"; };" \
+      >/etc/apt/apt.conf.d/99vtoyboot-ng
+    created /etc/apt/apt.conf.d/99vtoyboot-ng
+  fi
+  if [[ -d /etc/kernel/install.d ]] \
+    || command -v kernel-install >/dev/null; then
+    mkdir -p /etc/kernel/install.d
+    cat >/etc/kernel/install.d/95-vtoyboot-ng.install <<-EOT
+			#!/bin/sh
+			[ "\$1" = add ] || exit 0
+			exec ${r}
+		EOT
+    chmod +x /etc/kernel/install.d/95-vtoyboot-ng.install
+    created /etc/kernel/install.d/95-vtoyboot-ng.install
+  fi
+}
+
+# -------------------------------------------------------------- commands --
+
+cmd_install() {
+  KEEP_FALLBACK=0
+  [[ ${1:-} == --keep-fallback ]] && KEEP_FALLBACK=1
+  detect
+  [[ ${INITRD} == mfsroot ]] || check_exfat
+  mkdir -p "${ETC}"
+  touch "${ETC}/created"
+  local keep
+  keep=$(grep -h '^OSTREE_ENABLED=' "${ETC}/conf" 2>/dev/null || true)
+  printf 'KEEP_FALLBACK=%s\n%s\n' "${KEEP_FALLBACK}" "${keep}" >"${ETC}/conf"
+  install_hook
+  install_refresh_hooks
+  install_bootloader
+  regen_initramfs
+  msg "done"
+}
+
+cmd_refresh() {
+  [[ -f ${ETC}/conf ]] || exit 0
+  # shellcheck disable=SC1091
+  . "${ETC}/conf"
+  detect
+  local cfg
+  case ${BOOTLOADER} in
+    systemd-boot)
+      if [[ -n ${GRUB} ]]; then
+        cfg=$(grub_cfg)
+        "${GRUB}-mkconfig" -o "${cfg}"
+      else
+        msg "grub is gone, BIOS boot menu not updated"
+      fi
+      ;;
+    limine) limine_install ;;
+    freebsd) bsd_mfsroot ;;
+    *) ;;
+  esac
+  esp_fixup
+}
+
+cmd_uninstall() {
+  [[ -f ${ETC}/created ]] || die "not installed"
+  # shellcheck disable=SC1091
+  . "${ETC}/conf"
+  detect
+  local cfg f
+  while IFS= read -r f; do rm -f "${f}"; done <"${ETC}/created"
+  for f in fbx64.efi fallback.efi; do
+    [[ -n ${ESP} && -e ${ESP}/EFI/BOOT/${f}.vtoyboot ]] \
+      && mv "${ESP}/EFI/BOOT/${f}.vtoyboot" "${ESP}/EFI/BOOT/${f}"
+  done
+  rm -rf "${ETC}"
+  rmdir /boot/vtoyboot-ng 2>/dev/null || :
+  if [[ ${BOOTLOADER} == grub && -n ${GRUB} ]]; then
+    cfg=$(grub_cfg)
+    "${GRUB}-mkconfig" -o "${cfg}"
+  fi
+  regen_initramfs uninstall
+  msg "removed (BIOS boot code and partition left in place, they are harmless)"
+}
+
+main() {
+  case ${1:-} in
+    install)
+      shift
+      cmd_install "$@"
+      ;;
+    uninstall) cmd_uninstall ;;
+    refresh) cmd_refresh ;;
+    # the usage block at the top of this file
+    *)
+      sed -n '2,7p' "$0" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

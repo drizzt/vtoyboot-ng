@@ -1,0 +1,30 @@
+#!/bin/sh
+# vtoyboot-ng initramfs-tools hook (/etc/initramfs-tools/hooks/ventoy)
+PREREQ=""
+prereqs() { echo "${PREREQ}"; }
+case $1 in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+  *) ;;
+esac
+
+# both set by initramfs-tools when it runs the hook
+DESTDIR=${DESTDIR:?}
+
+# provided by initramfs-tools on the target, not present here
+# shellcheck source=/dev/null
+. /usr/share/initramfs-tools/hook-functions
+
+# shellcheck disable=SC2043  # @BINARIES@ is a list
+for b in @BINARIES@; do
+  # a binary missing from the host must not break the build
+  if bin=$(command -v "${b}"); then copy_exec "${bin}"; fi
+done
+# manual_add_modules ends up in dracut-install -o: modules missing from
+# $version are skipped, so the full list can go in as is
+# shellcheck disable=SC2086
+manual_add_modules @DRIVERS@
+mkdir -p "${DESTDIR}/etc/vtoyboot-ng/hook"
+cp /etc/vtoyboot-ng/hook/ventoy-map.sh "${DESTDIR}/etc/vtoyboot-ng/hook/"

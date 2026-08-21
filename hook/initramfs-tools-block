@@ -1,0 +1,14 @@
+#!/bin/sh
+# vtoyboot-ng initramfs-tools boot script, installed as
+# /etc/initramfs-tools/scripts/local-block/ventoy
+PREREQ=""
+prereqs() { echo "${PREREQ}"; }
+case $1 in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+  *) ;;
+esac
+
+sh /etc/vtoyboot-ng/hook/ventoy-map.sh

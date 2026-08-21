@@ -1,0 +1,28 @@
+#!/bin/bash
+# vtoyboot-ng mkinitcpio install hook (/etc/initcpio/install/ventoy)
+
+build() {
+  local m b
+  # shellcheck disable=SC2043  # @DRIVERS@ is a list
+  for m in @DRIVERS@; do
+    # trailing "?": skip a module $KERNELVERSION does not have
+    add_module "${m}?"
+  done
+  # shellcheck disable=SC2043  # @BINARIES@ is a list
+  for b in @BINARIES@; do
+    add_binary "${b}"
+  done
+  add_file /etc/vtoyboot-ng/hook/ventoy-map.sh
+  add_runscript
+  add_file /etc/systemd/system/ventoy-map.service
+  add_symlink \
+    /etc/systemd/system/initrd-root-device.target.wants/ventoy-map.service \
+    /etc/systemd/system/ventoy-map.service
+}
+
+help() {
+  cat <<HELPEOF
+Maps the Ventoy vdisk the system was booted from to a loop device so that
+root=UUID=... resolves. Does nothing on a normal boot.
+HELPEOF
+}
